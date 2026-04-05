@@ -209,6 +209,18 @@ class RegimeModel:
         # Classify
         self.regime_series = self._classify_regimes(driver).dropna()
 
+        # Guard against insufficient data
+        if len(self.regime_series) < 30:
+            raise ValueError(
+                f"Insufficient data to fit regime model: only {len(self.regime_series)} "
+                f"classified regime observations after warmup. "
+                f"Driver series has {len(driver)} points, but classification_window="
+                f"{cfg.classification_window} burns the first {cfg.classification_window-1} "
+                f"for rolling percentile. Supply more history (need at least "
+                f"{cfg.classification_window + 30} days) or reduce "
+                f"classification_window in RegimeConfig."
+            )
+
         # Current state (most recent non-NA)
         self.current_state = self.regime_series.iloc[-1]
         self.current_driver_value = driver.iloc[-1]
@@ -445,3 +457,26 @@ def fit_from_dashboard_data(
         for t in target_tickers if t in loader_data
     }
     return RegimeModel(config).fit(driver, targets)
+
+
+# ============================================================================
+# Entry point
+# ============================================================================
+
+if __name__ == '__main__':
+    # Example: load data via yfinance and fit model
+    import yfinance as yf
+
+    print("Fetching VIX, Brent, Gold...")
+    raw = yf.download(['^VIX', 'BZ=F', 'GC=F'], period='3y',
+                      interval='1d', progress=False, auto_adjust=True)
+
+    vix = raw['Close']['^VIX'].dropna()
+    brent = raw['Close']['BZ=F'].dropna()
+    gold = raw['Close']['GC=F'].dropna()
+
+    model = RegimeModel().fit(
+        driver_series=vix,
+        target_series={'BZ=F': brent, 'GC=F': gold},
+    )
+    print(model.report())

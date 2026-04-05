@@ -56,8 +56,22 @@ def load_geo_dashboard():
     return d
 
 @st.cache_data(ttl=3600, show_spinner="Fitting regime model...")
-def load_regime_model(_loader_data, driver_ticker='^VIX'):
-    return fit_from_dashboard_data(_loader_data, driver_ticker=driver_ticker)
+def load_regime_model():
+    """Fetches its own 3y history — the regime model needs long lookback
+    for the rolling percentile classification to warm up."""
+    import yfinance as yf
+    raw = yf.download(
+        ['^VIX', 'BZ=F', 'GC=F'],
+        period='3y', interval='1d',
+        progress=False, auto_adjust=True,
+    )
+    vix = raw['Close']['^VIX'].dropna()
+    brent = raw['Close']['BZ=F'].dropna()
+    gold = raw['Close']['GC=F'].dropna()
+    return RegimeModel().fit(
+        driver_series=vix,
+        target_series={'BZ=F': brent, 'GC=F': gold},
+    )
 
 
 # ============================================================================
@@ -301,7 +315,7 @@ with tab_summary:
 
     # Load everything we need
     geo_d = load_geo_dashboard()
-    regime_model = load_regime_model(geo_d.loader.data)
+    regime_model = load_regime_model()
 
     # Top row: key regime metrics
     col1, col2, col3, col4 = st.columns(4)
@@ -361,7 +375,8 @@ with tab_summary:
         forecast = regime_model.forecast(horizon=5)
         st.plotly_chart(
             plot_forecast(forecast, regime_model.current_state),
-            use_container_width=True,
+            width='stretch',
+            key='forecast_summary',
         )
 
     st.divider()
@@ -469,7 +484,7 @@ with tab_market:
         display = df[display_cols].copy()
         for col in ['ret_1d', 'ret_5d', 'ret_20d', 'vs_ma20_pct', 'vs_ma50_pct', 'vol_percentile']:
             display[col] = (display[col] * 100).round(2)
-        st.dataframe(display, use_container_width=True, hide_index=True)
+        st.dataframe(display, width='stretch', hide_index=True)
 
     # Commodities
     st.subheader("Commodity Futures")
@@ -480,7 +495,7 @@ with tab_market:
         display = df[display_cols].copy()
         for col in ['ret_1d', 'ret_5d', 'ret_20d', 'vs_ma20_pct', 'vs_ma50_pct', 'vol_percentile']:
             display[col] = (display[col] * 100).round(2)
-        st.dataframe(display, use_container_width=True, hide_index=True)
+        st.dataframe(display, width='stretch', hide_index=True)
 
     # Cross-asset
     st.subheader("Cross-Asset Signals")
@@ -526,11 +541,11 @@ with tab_geo:
     with col1:
         fig = plot_price_with_ma(geo_d.loader.data, 'BZ=F', title="Brent (BZ=F) - 6 months")
         if fig:
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width='stretch', key='geo_price_brent')
     with col2:
         fig = plot_price_with_ma(geo_d.loader.data, 'GC=F', title="Gold (GC=F) - 6 months")
         if fig:
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width='stretch', key='geo_price_gold')
 
     # Spread and correlation
     col1, col2 = st.columns(2)
@@ -538,11 +553,11 @@ with tab_geo:
         fig = plot_spread_history(geo_d.loader.data, 'BZ=F', 'CL=F',
                                    title="Brent-WTI Spread (geopolitical premium)")
         if fig:
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width='stretch', key='geo_spread_brent_wti')
     with col2:
         fig = plot_correlation_history(geo_d.loader.data, 'BZ=F', 'GC=F', 20)
         if fig:
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width='stretch', key='geo_corr_brent_gold')
 
     # Brent context detail
     st.subheader("Brent Context")
@@ -581,7 +596,7 @@ with tab_geo:
 with tab_regime:
     st.header("Markov Regime Model")
     geo_d = load_geo_dashboard()
-    regime_model = load_regime_model(geo_d.loader.data)
+    regime_model = load_regime_model()
 
     # Current state
     st.subheader("Current State")
@@ -597,7 +612,8 @@ with tab_regime:
     with col1:
         st.plotly_chart(
             plot_transition_heatmap(regime_model.transition_matrix),
-            use_container_width=True,
+            width='stretch',
+            key='regime_transition_matrix',
         )
         # Persistence metrics
         st.caption("**Regime persistence (diagonal):**")
@@ -609,12 +625,13 @@ with tab_regime:
         forecast = regime_model.forecast(horizon=5)
         st.plotly_chart(
             plot_forecast(forecast, regime_model.current_state),
-            use_container_width=True,
+            width='stretch',
+            key='forecast_regime_tab',
         )
         st.caption("**Forecast table:**")
         st.dataframe(
             (forecast * 100).round(1).astype(str) + '%',
-            use_container_width=True,
+            width='stretch',
         )
 
     st.divider()
@@ -625,11 +642,11 @@ with tab_regime:
     with col1:
         fig = plot_conditional_returns(regime_model.conditional_stats, 'BZ=F')
         if fig:
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width='stretch', key='cond_returns_brent')
     with col2:
         fig = plot_conditional_returns(regime_model.conditional_stats, 'GC=F')
         if fig:
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width='stretch', key='cond_returns_gold')
 
     # Full conditional stats tables
     st.subheader("Conditional Stats Detail")
@@ -647,7 +664,7 @@ with tab_regime:
                 'worst_5d': f"{s['worst_5d_fwd']*100:+.1f}%",
                 'best_5d': f"{s['best_5d_fwd']*100:+.1f}%",
             })
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(rows), width='stretch', hide_index=True)
 
     # Expected path returns
     st.divider()
