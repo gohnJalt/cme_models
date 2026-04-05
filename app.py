@@ -26,6 +26,9 @@ from datetime import datetime
 from market_dashboard import MarketDashboard, DashboardConfig
 from geo_dashboard import GeoTradeDashboard, GeoTradeConfig
 from markov_regime import RegimeModel, RegimeConfig, fit_from_dashboard_data
+from strategy_sweep import (
+    StrategySweep, SweepConfig, sweep_from_regime_model, format_sweep_table
+)
 
 
 # ============================================================================
@@ -74,16 +77,80 @@ def load_regime_model():
     )
 
 
+@st.cache_data(ttl=3600, show_spinner="Fetching E-Micro contracts...")
+def load_micro_contracts():
+    """
+    E-Micro futures: smaller notional versions of standard E-mini contracts.
+    Note: yfinance has patchy coverage on micros — we fetch what's available.
+    """
+    import yfinance as yf
+    micro_tickers = {
+        'MES=F': 'Micro E-mini S&P 500',
+        'MNQ=F': 'Micro E-mini Nasdaq-100',
+        'M2K=F': 'Micro E-mini Russell 2000',
+        'MYM=F': 'Micro E-mini Dow',
+        'MGC=F': 'Micro Gold',
+    }
+    raw = yf.download(
+        list(micro_tickers.keys()),
+        period='1y', interval='1d',
+        progress=False, auto_adjust=True,
+    )
+    data = {}
+    for t, name in micro_tickers.items():
+        try:
+            df = pd.DataFrame({
+                'open':  raw['Open'][t],
+                'high':  raw['High'][t],
+                'low':   raw['Low'][t],
+                'close': raw['Close'][t],
+                'volume': raw['Volume'][t],
+            }).dropna(subset=['close'])
+            if len(df) > 30:
+                data[t] = {'df': df, 'name': name}
+        except KeyError:
+            pass
+    return data
+
+
+@st.cache_data(ttl=3600, show_spinner="Running strategy sweep...")
+def run_strategy_sweep():
+    """Run strategy sweep on Brent and Gold using regime model."""
+    import yfinance as yf
+    raw = yf.download(
+        ['^VIX', 'BZ=F', 'GC=F'],
+        period='3y', interval='1d',
+        progress=False, auto_adjust=True,
+    )
+    vix = raw['Close']['^VIX'].dropna()
+    brent = raw['Close']['BZ=F'].dropna()
+    gold = raw['Close']['GC=F'].dropna()
+
+    model = RegimeModel().fit(
+        driver_series=vix,
+        target_series={'BZ=F': brent, 'GC=F': gold},
+    )
+    results = sweep_from_regime_model(model, {'BZ=F': brent, 'GC=F': gold})
+    return model.current_state, results
+
+
 # ============================================================================
 # Plotting helpers
 # ============================================================================
-def plot_price_with_ma(data, ticker, title=None):
-    """Price chart with 20 and 50 day MAs."""
+def plot_price_with_ma(data, ticker, title=None, sma_windows=(20, 50), lookback_days=180):
+    """Price chart with customizable SMAs.
+    
+    Parameters
+    ----------
+    data : dict of ticker -> OHLCV DataFrame
+    ticker : which ticker to plot
+    title : chart title (defaults to ticker)
+    sma_windows : tuple of SMA windows to overlay (e.g. (20, 50, 100))
+    lookback_days : how many recent days to show
+    """
     if ticker not in data:
         return None
-    df = data[ticker].tail(180).copy()
-    df['ma20'] = df['close'].rolling(20).mean()
-    df['ma50'] = df['close'].rolling(50).mean()
+    df = data[ticker].tail(lookback_days).copy()
 
     fig = go.Figure()
     fig.add_trace(go.Candlestick(
@@ -91,14 +158,17 @@ def plot_price_with_ma(data, ticker, title=None):
         low=df['low'], close=df['close'], name=ticker,
         increasing_line_color='#26a69a', decreasing_line_color='#ef5350',
     ))
-    fig.add_trace(go.Scatter(
-        x=df.index, y=df['ma20'], name='20MA',
-        line=dict(color='#ffa726', width=1.5)
-    ))
-    fig.add_trace(go.Scatter(
-        x=df.index, y=df['ma50'], name='50MA',
-        line=dict(color='#ab47bc', width=1.5)
-    ))
+
+    # Color palette for SMAs
+    sma_colors = ['#ffa726', '#ab47bc', '#29b6f6', '#66bb6a', '#ef5350']
+    for i, window in enumerate(sma_windows):
+        # Compute SMA on full series then slice (for edge accuracy)
+        sma = data[ticker]['close'].rolling(window).mean().tail(lookback_days)
+        fig.add_trace(go.Scatter(
+            x=sma.index, y=sma.values, name=f'SMA{window}',
+            line=dict(color=sma_colors[i % len(sma_colors)], width=1.5),
+        ))
+
     fig.update_layout(
         title=title or ticker,
         xaxis_rangeslider_visible=False,
@@ -302,8 +372,9 @@ st.title("CME Challenge Trading Dashboard")
 st.caption(f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
 
 # Tabs
-tab_summary, tab_market, tab_geo, tab_regime = st.tabs([
-    "Summary", "Market Overview", "Brent + Gold", "Regime Model"
+tab_summary, tab_market, tab_geo, tab_regime, tab_sweep, tab_micros = st.tabs([
+    "Summary", "Market Overview", "Brent + Gold", "Regime Model",
+    "Strategy Sweep", "E-Micros"
 ])
 
 
@@ -539,11 +610,19 @@ with tab_geo:
     # Price charts side by side
     col1, col2 = st.columns(2)
     with col1:
-        fig = plot_price_with_ma(geo_d.loader.data, 'BZ=F', title="Brent (BZ=F) - 6 months")
+        fig = plot_price_with_ma(
+            geo_d.loader.data, 'BZ=F',
+            title="Brent (BZ=F) - 6 months",
+            sma_windows=(10, 20, 50, 100),
+        )
         if fig:
             st.plotly_chart(fig, width='stretch', key='geo_price_brent')
     with col2:
-        fig = plot_price_with_ma(geo_d.loader.data, 'GC=F', title="Gold (GC=F) - 6 months")
+        fig = plot_price_with_ma(
+            geo_d.loader.data, 'GC=F',
+            title="Gold (GC=F) - 6 months",
+            sma_windows=(10, 20, 50, 100),
+        )
         if fig:
             st.plotly_chart(fig, width='stretch', key='geo_price_gold')
 
@@ -677,6 +756,194 @@ with tab_regime:
         col2.metric("Path Vol", f"{path['path_vol']*100:.2f}%")
         col3.metric("Expected Sharpe (annz)",
                     f"{path['expected_sharpe_annualized']:.2f}")
+
+
+# ============================================================================
+# Tab 5: Strategy Sweep
+# ============================================================================
+with tab_sweep:
+    st.header("Regime-Conditional Strategy Sweep")
+    st.caption(
+        "Tests trend-following and mean-reversion strategies across parameter grids, "
+        "filtered to historical dates where the VIX regime matched the **current** regime. "
+        "Top/bottom 5 results shown side-by-side for honest signal assessment."
+    )
+
+    try:
+        current_regime_sweep, sweep_results = run_strategy_sweep()
+    except Exception as e:
+        st.error(f"Sweep failed: {e}")
+        st.stop()
+
+    st.info(
+        f"**Current regime: {current_regime_sweep.upper()}**  — "
+        f"showing results conditional on this regime only. "
+        f"Each (n, m) pair requires at least 15 historical observations to be reported."
+    )
+
+    st.caption(
+        "**Strategy definitions:** "
+        "**Trend:** long when close > SMA(n) AND SMA(n) > SMA(m). "
+        "**Mean-rev:** long when close is at least `threshold%` below SMA(lookback). "
+        "Holding period: 5 days."
+    )
+
+    sweep_cols_trend = ['n', 'm', 'n_obs', 'mean', 'median', 'std',
+                        'win_rate', 'worst', 'best', 'sharpe_approx']
+    sweep_cols_mr = ['lookback', 'threshold_pct', 'n_obs', 'mean', 'median', 'std',
+                     'win_rate', 'worst', 'best', 'sharpe_approx']
+
+    for asset in sweep_results:
+        st.divider()
+        st.subheader(f"{asset}")
+        res = sweep_results[asset]
+
+        # Trend-following
+        st.markdown("**Trend-Following:**")
+        if res['trend_top'] is not None and len(res['trend_top']) > 0:
+            col_top, col_bot = st.columns(2)
+            with col_top:
+                st.caption("TOP 5 (best mean return)")
+                st.dataframe(
+                    format_sweep_table(res['trend_top'], sweep_cols_trend),
+                    width='stretch', hide_index=True,
+                )
+            with col_bot:
+                st.caption("BOTTOM 5 (worst mean return)")
+                st.dataframe(
+                    format_sweep_table(res['trend_bottom'], sweep_cols_trend),
+                    width='stretch', hide_index=True,
+                )
+        else:
+            st.caption("No trend-following combos met minimum observation threshold")
+
+        # Mean-reversion
+        st.markdown("**Mean-Reversion:**")
+        if res['mr_top'] is not None and len(res['mr_top']) > 0:
+            col_top, col_bot = st.columns(2)
+            with col_top:
+                st.caption("TOP 5 (best mean return)")
+                st.dataframe(
+                    format_sweep_table(res['mr_top'], sweep_cols_mr),
+                    width='stretch', hide_index=True,
+                )
+            with col_bot:
+                st.caption("BOTTOM 5 (worst mean return)")
+                st.dataframe(
+                    format_sweep_table(res['mr_bottom'], sweep_cols_mr),
+                    width='stretch', hide_index=True,
+                )
+        else:
+            st.caption("No mean-reversion combos met minimum observation threshold")
+
+    with st.expander("How to read these results"):
+        st.markdown("""
+        **Columns (all returns are 5-day forward, shown as %):**
+        - **n_obs**: number of historical signal triggers in the current regime
+        - **mean / median**: central tendency of 5-day returns after signals
+        - **std**: dispersion — higher means noisier signal
+        - **win_rate**: % of signals that produced positive returns
+        - **worst / best**: tail outcomes
+        - **sharpe_approx**: mean / std (not annualized, rough edge quality)
+
+        **What to look for:**
+        - High mean + high win_rate + low std = consistent edge
+        - High mean + low win_rate = a few lucky outliers, probably noise
+        - Top 5 and bottom 5 similar in magnitude = strategy has no regime edge
+        - Bottom 5 strongly negative = possible contrarian signal
+
+        **Caveats:**
+        - Results are biased toward parameters that *happened* to work in-sample
+        - Current regime may have thin history — check n_obs carefully
+        - Doesn't account for transaction costs or slippage
+        - Use as input to your judgment, not as an auto-trade rule
+        """)
+
+
+# ============================================================================
+# Tab 6: E-Micros
+# ============================================================================
+with tab_micros:
+    st.header("E-Micro Contracts")
+    st.caption(
+        "Smaller notional equivalents of standard E-mini contracts. "
+        "Useful for contest sizing when full E-mini margin is too large."
+    )
+
+    try:
+        micro_data = load_micro_contracts()
+    except Exception as e:
+        st.error(f"Failed to load micros: {e}")
+        micro_data = {}
+
+    if not micro_data:
+        st.warning(
+            "No E-Micro data loaded. yfinance has patchy coverage for micros — "
+            "they may be unavailable or temporarily rate-limited. "
+            "Try clicking Refresh Data in the sidebar."
+        )
+    else:
+        st.success(f"Loaded {len(micro_data)} micro contracts")
+
+        # Build a momentum table
+        rows = []
+        for ticker, info in micro_data.items():
+            df = info['df']
+            close = df['close']
+            if len(close) < 50:
+                continue
+            latest = close.iloc[-1]
+            ma20 = close.rolling(20).mean().iloc[-1]
+            ma50 = close.rolling(50).mean().iloc[-1]
+            ret_1d = close.pct_change().iloc[-1]
+            ret_5d = close.pct_change(5).iloc[-1]
+            ret_20d = close.pct_change(20).iloc[-1]
+            rvol = close.pct_change().rolling(20).std().iloc[-1] * (252 ** 0.5)
+            rows.append({
+                'ticker': ticker,
+                'name': info['name'],
+                'close': round(latest, 2),
+                'ret_1d': round(ret_1d * 100, 2),
+                'ret_5d': round(ret_5d * 100, 2),
+                'ret_20d': round(ret_20d * 100, 2),
+                'vs_ma20_pct': round((latest - ma20) / ma20 * 100, 2),
+                'vs_ma50_pct': round((latest - ma50) / ma50 * 100, 2),
+                'ann_vol_pct': round(rvol * 100, 1),
+            })
+        if rows:
+            st.dataframe(
+                pd.DataFrame(rows), width='stretch', hide_index=True,
+            )
+
+        # Price charts - 2 per row
+        st.divider()
+        st.subheader("Charts (candlestick + SMAs)")
+        tickers = list(micro_data.keys())
+        # Transform to format compatible with plot_price_with_ma
+        plot_data = {t: info['df'] for t, info in micro_data.items()}
+
+        for i in range(0, len(tickers), 2):
+            col_a, col_b = st.columns(2)
+            if i < len(tickers):
+                t = tickers[i]
+                with col_a:
+                    fig = plot_price_with_ma(
+                        plot_data, t,
+                        title=f"{t} — {micro_data[t]['name']}",
+                        sma_windows=(10, 20, 50),
+                    )
+                    if fig:
+                        st.plotly_chart(fig, width='stretch', key=f'micro_chart_{t}')
+            if i + 1 < len(tickers):
+                t = tickers[i + 1]
+                with col_b:
+                    fig = plot_price_with_ma(
+                        plot_data, t,
+                        title=f"{t} — {micro_data[t]['name']}",
+                        sma_windows=(10, 20, 50),
+                    )
+                    if fig:
+                        st.plotly_chart(fig, width='stretch', key=f'micro_chart_{t}')
 
 
 # Footer
